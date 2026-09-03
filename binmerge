@@ -25,12 +25,29 @@
 #  Please report any bugs on GitHub: https://github.com/putnam/binmerge
 #
 #
-import argparse, re, os, subprocess, sys, textwrap, traceback
+
+import argparse
+import os
+import re
+import sys
+import textwrap
+import time
+import traceback
+from pathlib import Path
+
 VERBOSE = False
-VERSION_STRING = "1.0.3"
+VERSION_STRING = "1.1.0"
+DEFAULT_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MiB Buffer
+
+# Pre-compiled regular expressions for cue sheet parsing
+FILE_RE = re.compile(r'FILE\s+"?(.*?)"?\s+BINARY', re.IGNORECASE)
+TRACK_RE = re.compile(r'TRACK\s+(\d+)\s+([^\s]+)', re.IGNORECASE)
+INDEX_RE = re.compile(r'INDEX\s+(\d+)\s+(\d+:\d+:\d+)', re.IGNORECASE)
+STAMP_RE = re.compile(r'(\d+):(\d+):(\d+)')
+
 
 def print_license():
-  print(textwrap.dedent(f"""
+    print(textwrap.dedent(f"""
     binmerge {VERSION_STRING}
     Copyright (C) 2024 Chris Putnam
 
@@ -51,328 +68,446 @@ def print_license():
     Source code available at: https://github.com/putnam/binmerge
   """))
 
+
 def d(s):
-  if VERBOSE:
-    print("[DEBUG]\t%s" % s)
+    if VERBOSE:
+        print(f"[DEBUG]\t{s}")
+
 
 def e(s):
-  print("[ERROR]\t%s" % s)
+    print(f"[ERROR]\t{s}")
+
 
 def p(s):
-  print("[INFO]\t%s" % s)
+    print(f"[INFO]\t{s}")
+
+
+class ProgressBar:
+
+    def __init__(self, total_bytes, prefix=""):
+        self.total_bytes = max(1, total_bytes)
+        self.prefix = prefix
+        self.current_bytes = 0
+        self.start_time = time.time()
+        self.last_update = 0
+
+    def update(self, bytes_added):
+        self.current_bytes += bytes_added
+        now = time.time()
+        # Cap display updates to 10 times per second to minimize terminal overhead
+        if now - self.last_update < 0.1 and self.current_bytes < self.total_bytes:
+            return
+        self.last_update = now
+
+        elapsed = max(0.001, now - self.start_time)
+        speed = self.current_bytes / elapsed
+        percent = (self.current_bytes / self.total_bytes) * 100
+
+        remaining_bytes = max(0, self.total_bytes - self.current_bytes)
+        eta_seconds = int(remaining_bytes / speed) if speed > 0 else 0
+
+        eta_m, eta_s = divmod(eta_seconds, 60)
+        eta_h, eta_m = divmod(eta_m, 60)
+        eta_str = f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}" if eta_h > 0 else f"{eta_m:02d}:{eta_s:02d}"
+
+        curr_mb = self.current_bytes / (1024 * 1024)
+        total_mb = self.total_bytes / (1024 * 1024)
+        speed_mb = speed / (1024 * 1024)
+
+        bar_length = 20
+        filled_length = int(bar_length * self.current_bytes // self.total_bytes)
+        bar = "█" * filled_length + "░" * (bar_length - filled_length)
+
+        prefix_str = f"[{self.prefix}] " if self.prefix else ""
+        sys.stdout.write(
+            f"\r{prefix_str}[{bar}] {percent:5.1f}% | {curr_mb:.2f} MB / {total_mb:.2f} MB | {speed_mb:5.1f} MB/s | ETA: {eta_str}"
+        )
+        sys.stdout.flush()
+
+    def finish(self):
+        self.update(0)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
 
 class Track:
-  globalBlocksize = None
 
-  def __init__(self, num, track_type):
-    self.num = num
-    self.indexes = []
-    self.track_type = track_type
-    self.sectors = None
-    self.file_offset = None
+    def __init__(self, num, track_type, disc_blocksize_ref):
+        self.num = num
+        self.indexes = []
+        self.track_type = track_type
+        self.sectors = None
+        self.file_offset = None
 
-    # All possible blocksize types. You cannot mix types on a disc, so we will use the first one we see and lock it in.
-    #
-    # AUDIO – Audio/Music (2352)
-    # CDG – Karaoke CD+G (2448)
-    # MODE1/2048 – CDROM Mode1 Data (cooked)
-    # MODE1/2352 – CDROM Mode1 Data (raw)
-    # MODE2/2336 – CDROM-XA Mode2 Data
-    # MODE2/2352 – CDROM-XA Mode2 Data
-    # CDI/2336 – CDI Mode2 Data
-    # CDI/2352 – CDI Mode2 Data
-    if not Track.globalBlocksize:
-      if track_type in ['AUDIO', 'MODE1/2352', 'MODE2/2352', 'CDI/2352']:
-        Track.globalBlocksize = 2352
-      elif track_type == 'CDG':
-        Track.globalBlocksize = 2448
-      elif track_type == 'MODE1/2048':
-        Track.globalBlocksize = 2048
-      elif track_type in ['MODE2/2336', 'CDI/2336']:
-        Track.globalBlocksize = 2336
-      d("Locked blocksize to %d" % Track.globalBlocksize)
+        # Lock the global blocksize per disc processing context
+        if disc_blocksize_ref[0] is None:
+            if track_type in ['AUDIO', 'MODE1/2352', 'MODE2/2352', 'CDI/2352']:
+                disc_blocksize_ref[0] = 2352
+            elif track_type == 'CDG':
+                disc_blocksize_ref[0] = 2448
+            elif track_type == 'MODE1/2048':
+                disc_blocksize_ref[0] = 2048
+            elif track_type in ['MODE2/2336', 'CDI/2336']:
+                disc_blocksize_ref[0] = 2336
+            d(f"Locked disc blocksize to {disc_blocksize_ref[0]}")
+
 
 class File:
-  def __init__(self, filename):
-    self.filename = filename
-    self.tracks = []
-    self.size = os.path.getsize(filename)
+
+    def __init__(self, filename):
+        self.filename = Path(filename)
+        self.tracks = []
+        self.size = self.filename.stat().st_size
+
 
 class ZeroBinFilesException(Exception):
-  pass
+    pass
+
 
 class BinFilesMissingException(Exception):
-  pass
+    pass
+
 
 def read_cue_file(cue_path):
-  files = []
-  this_track = None
-  this_file = None
-  bin_files_missing = False
+    files = []
+    this_track = None
+    this_file = None
+    bin_files_missing = False
+    disc_blocksize_ref = [None]  # Encapsulated blocksize context per disc
 
-  f = open(cue_path, 'r')
-  for line in f:
-    m = re.search(r'FILE "?(.*?)"? BINARY', line)
-    if m:
-      this_path = os.path.join(os.path.dirname(cue_path), m.group(1))
-      if not (os.path.isfile(this_path) or os.access(this_path, os.R_OK)):
-        e("Bin file not found or not readable: %s" % this_path)
-        bin_files_missing = True
-      else:
-        this_file = File(this_path)
-        files.append(this_file)
-      continue
+    cue_path = Path(cue_path)
+    with cue_path.open('r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            m = FILE_RE.search(line)
+            if m:
+                this_path = cue_path.parent / m.group(1)
+                if not this_path.is_file():
+                    e(f"Bin file not found or not readable: {this_path}")
+                    bin_files_missing = True
+                else:
+                    this_file = File(this_path)
+                    files.append(this_file)
+                continue
 
-    m = re.search(r'TRACK (\d+) ([^\s]*)', line)
-    if m and this_file:
-      this_track = Track(int(m.group(1)), m.group(2))
-      this_file.tracks.append(this_track)
-      continue
+            m = TRACK_RE.search(line)
+            if m and this_file:
+                this_track = Track(int(m.group(1)), m.group(2), disc_blocksize_ref)
+                this_file.tracks.append(this_track)
+                continue
 
-    m = re.search(r'INDEX (\d+) (\d+:\d+:\d+)', line)
-    if m and this_track:
-      this_track.indexes.append({'id': int(m.group(1)), 'stamp': m.group(2), 'file_offset':cuestamp_to_sectors(m.group(2))})
-      continue
+            m = INDEX_RE.search(line)
+            if m and this_track:
+                this_track.indexes.append({
+                    'id': int(m.group(1)),
+                    'stamp': m.group(2),
+                    'file_offset': cuestamp_to_sectors(m.group(2))
+                })
+                continue
 
-  if bin_files_missing:
-    raise BinFilesMissingException
+    if bin_files_missing:
+        raise BinFilesMissingException
 
-  if not len(files):
-    raise ZeroBinFilesException
+    if not files:
+        raise ZeroBinFilesException
 
-  if len(files) == 1:
-    # only 1 file, assume splitting, calc sectors of each
-    next_item_offset = files[0].size // Track.globalBlocksize
-    for t in reversed(files[0].tracks):
-      t.sectors = next_item_offset - t.indexes[0]["file_offset"]
-      next_item_offset = t.indexes[0]["file_offset"]
+    global_blocksize = disc_blocksize_ref[0] or 2352
 
-  for f in files:
-    d("-- File --")
-    d("Filename: %s" % f.filename)
-    d("Size: %d" % f.size)
-    d("Tracks:")
+    if len(files) == 1:
+        # Enforce integer division for sector offsets
+        next_item_offset = files[0].size // global_blocksize
+        for t in reversed(files[0].tracks):
+            t.sectors = next_item_offset - t.indexes[0]["file_offset"]
+            next_item_offset = t.indexes[0]["file_offset"]
 
-    for t in f.tracks:
-      d("  -- Track --")
-      d("  Num: %d" % t.num)
-      d("  Type: %s" % t.track_type)
-      if t.sectors: d("  Sectors: %s" % t.sectors)
-      d("  Indexes: %s" % repr(t.indexes))
+    for f in files:
+        d("-- File --")
+        d(f"Filename: {f.filename}")
+        d(f"Size: {f.size}")
+        d("Tracks:")
+        for t in f.tracks:
+            d("  -- Track --")
+            d(f"  Num: {t.num}")
+            d(f"  Type: {t.track_type}")
+            if t.sectors:
+                d(f"  Sectors: {t.sectors}")
+            d(f"  Indexes: {t.indexes}")
 
-  return files
+    return files, global_blocksize
 
 
 def sectors_to_cuestamp(sectors):
-  # 75 sectors per second
-  minutes = sectors / 4500
-  fields = sectors % 4500
-  seconds = fields / 75
-  fields = sectors % 75
-  return '%02d:%02d:%02d' % (minutes, seconds, fields)
+    minutes = sectors // 4500
+    fields = sectors % 4500
+    seconds = fields // 75
+    fields = fields % 75
+    return f"{minutes:02d}:{seconds:02d}:{fields:02d}"
+
 
 def cuestamp_to_sectors(stamp):
-  # 75 sectors per second
-  m = re.match(r"(\d+):(\d+):(\d+)", stamp)
-  minutes = int(m.group(1))
-  seconds = int(m.group(2))
-  fields = int(m.group(3))
-  return fields + (seconds * 75) + (minutes * 60 * 75)
+    m = STAMP_RE.match(stamp)
+    if not m:
+        return 0
+    minutes = int(m.group(1))
+    seconds = int(m.group(2))
+    fields = int(m.group(3))
+    return fields + (seconds * 75) + (minutes * 60 * 75)
 
-# Generates track filename based on redump naming convention
-# (Note: prefix should NEVER contain a path; this function deals only in filenames)
+
 def track_filename(prefix, track_num, track_count):
-  # Redump is strangely inconsistent in their datfiles and cuesheets when it
-  # comes to track numbers. The naming convention currently seems to be:
-  # If there is exactly one track: "" (nothing)
-  # If there are less than 10 tracks: "Track 1", "Track 2", etc.
-  # If there are more than 10 tracks: "Track 01", "Track 02", etc.
-  #
-  # It'd be nice if it were consistently %02d!
-  #
-  # TODO: Migrate everything to pathlib
-  if track_count == 1:
-    return "%s.bin" % (prefix)
-  if track_count > 9:
-    return "%s (Track %02d).bin" % (prefix, track_num)
-  return "%s (Track %d).bin" % (prefix, track_num)
+    if track_count == 1:
+        return f"{prefix}.bin"
+    if track_count > 9:
+        return f"{prefix} (Track {track_num:02d}).bin"
+    return f"{prefix} (Track {track_num}).bin"
 
-# Generates a 'merged' cuesheet, that is, one bin file with tracks indexed within.
-def gen_merged_cuesheet(basename, files):
-  cuesheet = 'FILE "%s.bin" BINARY\n' % basename
-  # One sector is (BLOCKSIZE) bytes
-  sector_pos = 0
-  for f in files:
-    for t in f.tracks:
-      cuesheet += '  TRACK %02d %s\n' % (t.num, t.track_type)
-      for i in t.indexes:
-        cuesheet += '    INDEX %02d %s\n' % (i['id'], sectors_to_cuestamp(sector_pos + i['file_offset']))
-    sector_pos += f.size / Track.globalBlocksize
-  return cuesheet
 
-# Generates a 'split' cuesheet, that is, with one bin file for every track.
-def gen_split_cuesheet(basename, merged_file):
-  cuesheet = ""
-  for t in merged_file.tracks:
-    track_fn = track_filename(basename, t.num, len(merged_file.tracks))
-    cuesheet += 'FILE "%s" BINARY\n' % track_fn
-    cuesheet += '  TRACK %02d %s\n' % (t.num, t.track_type)
-    for i in t.indexes:
-      sector_pos = i['file_offset'] - t.indexes[0]['file_offset']
-      cuesheet += '    INDEX %02d %s\n' % (i['id'], sectors_to_cuestamp(sector_pos))
-  return cuesheet
-
-# Merges files together to new file `merged_filename`, in listed order.
-def merge_files(merged_filename, files):
-  if os.path.exists(merged_filename):
-    e('Target merged bin path already exists: %s' % merged_filename)
-    return False
-
-  # cat is actually a bit faster, but this is multi-platform and no special-casing
-  chunksize = 1024 * 1024
-  with open(merged_filename, 'wb') as outfile:
+def gen_merged_cuesheet(basename, files, global_blocksize):
+    cuesheet = f'FILE "{basename}.bin" BINARY\n'
+    sector_pos = 0
     for f in files:
-      with open(f.filename, 'rb') as infile:
-        while True:
-          chunk = infile.read(chunksize)
-          if not chunk:
-            break
-          outfile.write(chunk)
-  return True
+        for t in f.tracks:
+            cuesheet += f'  TRACK {t.num:02d} {t.track_type}\n'
+            for i in t.indexes:
+                cuesheet += f'    INDEX {i["id"]:02d} {sectors_to_cuestamp(sector_pos + i["file_offset"])}\n'
+        # Integer division for sector position updates
+        sector_pos += f.size // global_blocksize
+    return cuesheet
 
-# Writes each track in a File to a new file
-def split_files(new_basename, merged_file, outdir):
-  with open(merged_file.filename, 'rb') as infile:
-    # Check all tracks for potential file-clobbering first before writing anything
+
+def gen_split_cuesheet(basename, merged_file):
+    cuesheet = ""
     for t in merged_file.tracks:
-      out_basename = track_filename(new_basename, t.num, len(merged_file.tracks))
-      out_path = os.path.join(outdir, out_basename)
-      if os.path.exists(out_path):
-        e('Target bin path already exists: %s' % out_path)
+        track_fn = track_filename(basename, t.num, len(merged_file.tracks))
+        cuesheet += f'FILE "{track_fn}" BINARY\n'
+        cuesheet += f'  TRACK {t.num:02d} {t.track_type}\n'
+        for i in t.indexes:
+            sector_pos = i['file_offset'] - t.indexes[0]['file_offset']
+            cuesheet += f'    INDEX {i["id"]:02d} {sectors_to_cuestamp(sector_pos)}\n'
+    return cuesheet
+
+
+def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=False):
+    merged_path = Path(merged_filename)
+    if merged_path.exists() and not force:
+        e(f"Target merged bin path already exists: {merged_path}")
         return False
 
-    for t in merged_file.tracks:
-      chunksize = 1024 * 1024
-      out_basename = track_filename(new_basename, t.num, len(merged_file.tracks))
-      out_path = os.path.join(outdir, out_basename)
-      tracksize = t.sectors * Track.globalBlocksize
-      written = 0
-      with open(out_path, 'wb') as outfile:
-        d('Writing bin file: %s' % out_path)
-        while True:
-          if chunksize + written > tracksize:
-            chunksize = tracksize - written
-          chunk = infile.read(chunksize)
-          outfile.write(chunk)
-          written += chunksize
-          if written == tracksize:
-            break
-  return True
+    total_bytes = sum(f.size for f in files)
+    progress = ProgressBar(total_bytes, prefix="MERGE")
 
-def main():
-  parser = argparse.ArgumentParser(description="Using a cuesheet, merges numerous bin files into a single bin file and produces a new cuesheet with corrected offsets. Works great with Redump. Supports all block modes, but only binary track types.")
-  parser.add_argument('cuefile', help='path to current cue file (bin files are expected in the same dir)')
-  parser.add_argument('basename', help='name (without extension) for your new bin/cue files; will be placed in the same dir as input unless --outdir is specified')
+    try:
+        with open(merged_path, 'wb') as outfile:
+            out_fd = outfile.fileno()
 
-  # argparse is bad. make -l work like -h (no args required)
-  class licenseAction(argparse._StoreTrueAction):
-    def __call__(self, parser, namespace, values, option_string=None):
-      print_license()
-      parser.exit()
-  parser.add_argument('-l', '--license', default=False, help='prints license info and exits', action=licenseAction)
-  parser.add_argument('-v', '--verbose', action='store_true', help='print more verbose messages')
-  parser.add_argument('-s', '--split', help='reverses operation, splitting merged files back to individual tracks', required=False, action='store_true')
-  parser.add_argument('-o', '--outdir', default=False, help='output directory. defaults to the same directory as source cue. directory will be created (recursively) if needed.')
+            for f in files:
+                with open(f.filename, 'rb') as infile:
+                    in_fd = infile.fileno()
+                    remaining = f.size
 
-  args = parser.parse_args()
+                    # Fast-path attempt using kernel sendfile zero-copy
+                    use_sendfile = hasattr(os, 'sendfile')
+                    if use_sendfile:
+                        offset = 0
+                        while remaining > 0:
+                            chunk_to_send = min(remaining, buffer_size)
+                            try:
+                                sent = os.sendfile(out_fd, in_fd, offset, chunk_to_send)
+                                if sent == 0:
+                                    break
+                                offset += sent
+                                remaining -= sent
+                                progress.update(sent)
+                            except (OSError, AttributeError) as err:
+                                d(f"sendfile unavailable or failed ({err}), falling back to standard read/write")
+                                use_sendfile = False
+                                break
 
-  if args.verbose:
-    global VERBOSE
-    VERBOSE = True
+                    # Standard buffered fallback loop
+                    if not use_sendfile:
+                        while True:
+                            chunk = infile.read(buffer_size)
+                            if not chunk:
+                                break
+                            outfile.write(chunk)
+                            progress.update(len(chunk))
+    except Exception as ex:
+        e(f"Error during file merge: {ex}")
+        return False
 
-  # Resolve relative paths and cwd
-  cuefile = os.path.abspath(args.cuefile)
+    progress.finish()
+    return True
 
-  if not os.path.exists(cuefile):
-    e("Cue file does not exist: %s" % cuefile)
-    return False
 
-  if not os.access(cuefile, os.R_OK):
-    e("Cue file is not readable: %s" % cuefile)
-    return False
+def split_files(new_basename, merged_file, outdir, global_blocksize, buffer_size=DEFAULT_BUFFER_SIZE, force=False):
+    outdir_path = Path(outdir)
 
-  if args.outdir:
-    outdir = os.path.abspath(args.outdir)
-    p("Output directory: %s" % outdir)
-    if not os.path.exists(outdir):
-      try:
-        p("Output directory did not exist; creating it.")
-        os.makedirs(outdir)
-      except:
-        e("Could not create output directory (permissions?)")
+    # Check target files first to prevent accidental clobbering
+    if not force:
+        for t in merged_file.tracks:
+            out_basename = track_filename(new_basename, t.num, len(merged_file.tracks))
+            out_path = outdir_path / out_basename
+            if out_path.exists():
+                e(f"Target bin path already exists: {out_path}")
+                return False
+
+    total_tracks = len(merged_file.tracks)
+    with open(merged_file.filename, 'rb') as infile:
+        for idx, t in enumerate(merged_file.tracks, 1):
+            out_basename = track_filename(new_basename, t.num, total_tracks)
+            out_path = outdir_path / out_basename
+            tracksize = t.sectors * global_blocksize
+
+            p(f"Writing track {idx}/{total_tracks}: {out_basename}")
+            progress = ProgressBar(tracksize, prefix=f"SPLIT {idx}/{total_tracks}")
+            written = 0
+
+            with open(out_path, 'wb') as outfile:
+                while written < tracksize:
+                    to_read = min(buffer_size, tracksize - written)
+                    chunk = infile.read(to_read)
+
+                    if not chunk:
+                        progress.finish()
+                        raise IOError(f"Unexpected end of merged BIN file while processing Track {t.num}")
+
+                    outfile.write(chunk)
+                    chunk_len = len(chunk)
+                    written += chunk_len
+                    progress.update(chunk_len)
+
+            progress.finish()
+    return True
+
+
+def process_single_cue(cuefile, basename, outdir, is_split, force, buffer_size=DEFAULT_BUFFER_SIZE):
+    cuefile_path = Path(cuefile).resolve()
+
+    if not cuefile_path.is_file():
+        e(f"Cue file does not exist: {cuefile_path}")
+        return False
+
+    outdir_path = Path(outdir) if outdir else cuefile_path.parent
+    if not outdir_path.exists():
+        try:
+            p(f"Output directory did not exist; creating: {outdir_path}")
+            outdir_path.mkdir(parents=True, exist_ok=True)
+        except Exception as ex:
+            e(f"Could not create output directory: {ex}")
+            return False
+
+    p(f"Opening cue: {cuefile_path}")
+    try:
+        cue_map, global_blocksize = read_cue_file(cuefile_path)
+    except BinFilesMissingException:
+        e("One or more bin files were missing on disk. Aborting.")
+        return False
+    except ZeroBinFilesException:
+        e("Unable to parse any bin files in the cuesheet. Is it empty?")
+        return False
+    except Exception:
+        e("Error parsing cuesheet. Is it valid?")
         traceback.print_exc()
         return False
-  else:
-    outdir = os.path.dirname(cuefile)
-    p("Output directory: %s" % outdir)
 
-  if not (os.path.exists(outdir) or os.path.isdir(outdir)):
-    e("Output directory does not exist or is not a directory: %s" % outdir)
-    return False
+    new_cue_fn = outdir_path / f"{basename}.cue"
+    if new_cue_fn.exists() and not force:
+        e(f"Output cue file already exists. Quitting: {new_cue_fn}")
+        return False
 
-  if not os.access(outdir, os.W_OK):
-    e("Output directory is not writable: %s" % outdir)
-    return False
-
-  p("Opening cue: %s" % cuefile)
-  try:
-    cue_map = read_cue_file(cuefile)
-  except BinFilesMissingException:
-    e("One or more bin files were missing on disk. Aborting.")
-    return False
-  except ZeroBinFilesException:
-    e("Unable to parse any bin files in the cuesheet. Is it empty?")
-    return False
-  except Exception as exc:
-    e("Error parsing cuesheet. Is it valid?")
-    traceback.print_exc()
-    return False
-
-  if args.split:
-    cuesheet = gen_split_cuesheet(args.basename, cue_map[0])
-  else:
-    cuesheet = gen_merged_cuesheet(args.basename, cue_map)
-
-  if not os.path.exists(outdir):
-    e("Output dir does not exist")
-    return False
-
-  new_cue_fn = os.path.join(outdir, args.basename+'.cue')
-  if os.path.exists(new_cue_fn):
-    e("Output cue file already exists. Quitting. Path: %s" % new_cue_fn)
-    return False
-
-  if args.split:
-    p("Splitting files...")
-    if split_files(args.basename, cue_map[0], outdir):
-      p("Wrote %d bin files" % len(cue_map[0].tracks))
+    if is_split:
+        cuesheet = gen_split_cuesheet(basename, cue_map[0])
+        p(f"Splitting {len(cue_map[0].tracks)} tracks...")
+        if split_files(basename, cue_map[0], outdir_path, global_blocksize, buffer_size, force=force):
+            p(f"Wrote {len(cue_map[0].tracks)} bin files")
+        else:
+            e("Unable to split bin files.")
+            return False
     else:
-      e("Unable to split bin files.")
-      return False
-  else:
-    p("Merging %d tracks..." % len(cue_map))
-    out_path = os.path.join(outdir, args.basename+'.bin')
-    if merge_files(out_path, cue_map):
-      p("Wrote %s" % out_path)
-    else:
-      e("Unable to merge bin files.")
-      return False
+        cuesheet = gen_merged_cuesheet(basename, cue_map, global_blocksize)
+        p(f"Merging {len(cue_map)} tracks...")
+        out_path = outdir_path / f"{basename}.bin"
+        if merge_files(out_path, cue_map, buffer_size=buffer_size, force=force):
+            p(f"Wrote {out_path}")
+        else:
+            e("Unable to merge bin files.")
+            return False
 
-  with open(new_cue_fn, 'w', newline='\r\n') as f:
-    f.write(cuesheet)
-  p("Wrote new cue: %s" % new_cue_fn)
+    with open(new_cue_fn, 'w', newline='\r\n', encoding='utf-8') as f:
+        f.write(cuesheet)
+    p(f"Wrote new cue: {new_cue_fn}")
 
-  return True
+    return True
 
-if not main():
-  sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Merges or splits BIN/CUE files with optimized I/O operations."
+    )
+    parser.add_argument('cuefile', nargs='?', help='Path to cue file (or directory if using --batch).')
+    parser.add_argument('basename', nargs='?', help='Base name for generated output files.')
+
+    class LicenseAction(argparse._StoreTrueAction):
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            print_license()
+            parser.exit()
+
+    parser.add_argument('-l', '--license', default=False, help='Prints license info and exits', action=LicenseAction)
+    parser.add_argument('-v', '--verbose', action='store_true', help='Print debug messages')
+    parser.add_argument('-s', '--split', action='store_true', help='Splits a merged BIN file back into individual tracks')
+    parser.add_argument('-o', '--outdir', default=None, help='Output directory (defaults to CUE directory)')
+    parser.add_argument('-f', '--force', action='store_true', help='Overwrite existing output files')
+    parser.add_argument('--batch', help='Process all .cue files in the specified directory sequentially')
+    parser.add_argument('--buffer-mb', type=int, default=16, help='Set I/O buffer size in MiB (default: 16 MiB)')
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        global VERBOSE
+        VERBOSE = True
+
+    buffer_bytes = max(1, args.buffer_mb) * 1024 * 1024
+
+    # Batch processing execution path
+    if args.batch:
+        batch_dir = Path(args.batch).resolve()
+        if not batch_dir.is_dir():
+            e(f"Batch path is not a valid directory: {batch_dir}")
+            return False
+
+        cue_files = sorted(list(batch_dir.glob("*.cue")))
+        if not cue_files:
+            e(f"No .cue files found in {batch_dir}")
+            return False
+
+        p(f"Found {len(cue_files)} CUE files for batch processing.")
+        for idx, cue_path in enumerate(cue_files, 1):
+            base_name = cue_path.stem + "_merged"
+            p(f"\n[{idx}/{len(cue_files)}] Processing batch item: {cue_path.name}")
+            process_single_cue(
+                cue_path,
+                base_name,
+                args.outdir,
+                args.split,
+                args.force,
+                buffer_size=buffer_bytes
+            )
+        return True
+
+    # Single-file processing execution path
+    if not args.cuefile or not args.basename:
+        parser.error("cuefile and basename are required unless using --batch.")
+
+    return process_single_cue(
+        args.cuefile,
+        args.basename,
+        args.outdir,
+        args.split,
+        args.force,
+        buffer_size=buffer_bytes
+    )
+
+
+if __name__ == '__main__':
+    if not main():
+        sys.exit(1)
