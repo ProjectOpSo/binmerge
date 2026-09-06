@@ -21,9 +21,7 @@
 #  with this program; if not, write to the Free Software Foundation, Inc.,
 #  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 #
-#
 #  Please report any bugs on GitHub: https://github.com/putnam/binmerge
-#
 #
 
 import argparse
@@ -47,6 +45,7 @@ STAMP_RE = re.compile(r'(\d+):(\d+):(\d+)')
 
 
 def print_license():
+    """Prints the GPL license text and copyright details."""
     print(textwrap.dedent(f"""
     binmerge {VERSION_STRING}
     Copyright (C) 2024 Chris Putnam
@@ -70,19 +69,23 @@ def print_license():
 
 
 def d(s):
+    """Prints debug log messages if verbose mode is enabled."""
     if VERBOSE:
         print(f"[DEBUG]\t{s}")
 
 
 def e(s):
+    """Prints error messages to the standard output."""
     print(f"[ERROR]\t{s}")
 
 
 def p(s):
+    """Prints standard info messages to the standard output."""
     print(f"[INFO]\t{s}")
 
 
 class ProgressBar:
+    """Renders a real-time progress bar with transfer speed and ETA calculation."""
 
     def __init__(self, total_bytes, prefix=""):
         self.total_bytes = max(1, total_bytes)
@@ -92,9 +95,9 @@ class ProgressBar:
         self.last_update = 0
 
     def update(self, bytes_added):
+        """Updates byte progress and prints formatted progress bar line."""
         self.current_bytes += bytes_added
         now = time.time()
-        # Cap display updates to 10 times per second to minimize terminal overhead
         if now - self.last_update < 0.1 and self.current_bytes < self.total_bytes:
             return
         self.last_update = now
@@ -125,12 +128,14 @@ class ProgressBar:
         sys.stdout.flush()
 
     def finish(self):
+        """Completes the progress bar display and moves to a new line."""
         self.update(0)
         sys.stdout.write("\n")
         sys.stdout.flush()
 
 
 class Track:
+    """Represents an individual track defined within a CUE sheet."""
 
     def __init__(self, num, track_type, disc_blocksize_ref):
         self.num = num
@@ -139,7 +144,6 @@ class Track:
         self.sectors = None
         self.file_offset = None
 
-        # Lock the global blocksize per disc processing context
         if disc_blocksize_ref[0] is None:
             if track_type in ['AUDIO', 'MODE1/2352', 'MODE2/2352', 'CDI/2352']:
                 disc_blocksize_ref[0] = 2352
@@ -153,6 +157,7 @@ class Track:
 
 
 class File:
+    """Represents a BIN file referenced inside a CUE sheet."""
 
     def __init__(self, filename):
         self.filename = Path(filename)
@@ -161,19 +166,22 @@ class File:
 
 
 class ZeroBinFilesException(Exception):
+    """Raised when no binary files are found in the parsed CUE sheet."""
     pass
 
 
 class BinFilesMissingException(Exception):
+    """Raised when referenced BIN files do not exist on disk."""
     pass
 
 
 def read_cue_file(cue_path):
+    """Parses a CUE file and maps its tracks, files, and sector offsets."""
     files = []
     this_track = None
     this_file = None
     bin_files_missing = False
-    disc_blocksize_ref = [None]  # Encapsulated blocksize context per disc
+    disc_blocksize_ref = [None]
 
     cue_path = Path(cue_path)
     with cue_path.open('r', encoding='utf-8', errors='replace') as f:
@@ -213,29 +221,16 @@ def read_cue_file(cue_path):
     global_blocksize = disc_blocksize_ref[0] or 2352
 
     if len(files) == 1:
-        # Enforce integer division for sector offsets
         next_item_offset = files[0].size // global_blocksize
         for t in reversed(files[0].tracks):
             t.sectors = next_item_offset - t.indexes[0]["file_offset"]
             next_item_offset = t.indexes[0]["file_offset"]
 
-    for f in files:
-        d("-- File --")
-        d(f"Filename: {f.filename}")
-        d(f"Size: {f.size}")
-        d("Tracks:")
-        for t in f.tracks:
-            d("  -- Track --")
-            d(f"  Num: {t.num}")
-            d(f"  Type: {t.track_type}")
-            if t.sectors:
-                d(f"  Sectors: {t.sectors}")
-            d(f"  Indexes: {t.indexes}")
-
     return files, global_blocksize
 
 
 def sectors_to_cuestamp(sectors):
+    """Converts sector counts into a CUE time code string (MM:SS:FF)."""
     minutes = sectors // 4500
     fields = sectors % 4500
     seconds = fields // 75
@@ -244,6 +239,7 @@ def sectors_to_cuestamp(sectors):
 
 
 def cuestamp_to_sectors(stamp):
+    """Converts a CUE time code string (MM:SS:FF) into sector counts."""
     m = STAMP_RE.match(stamp)
     if not m:
         return 0
@@ -254,6 +250,7 @@ def cuestamp_to_sectors(stamp):
 
 
 def track_filename(prefix, track_num, track_count):
+    """Formats output filenames for individual tracks when splitting."""
     if track_count == 1:
         return f"{prefix}.bin"
     if track_count > 9:
@@ -262,6 +259,7 @@ def track_filename(prefix, track_num, track_count):
 
 
 def gen_merged_cuesheet(basename, files, global_blocksize):
+    """Generates a new CUE sheet string for a single merged BIN file."""
     cuesheet = f'FILE "{basename}.bin" BINARY\n'
     sector_pos = 0
     for f in files:
@@ -269,12 +267,12 @@ def gen_merged_cuesheet(basename, files, global_blocksize):
             cuesheet += f'  TRACK {t.num:02d} {t.track_type}\n'
             for i in t.indexes:
                 cuesheet += f'    INDEX {i["id"]:02d} {sectors_to_cuestamp(sector_pos + i["file_offset"])}\n'
-        # Integer division for sector position updates
         sector_pos += f.size // global_blocksize
     return cuesheet
 
 
 def gen_split_cuesheet(basename, merged_file):
+    """Generates a CUE sheet string corresponding to multiple split track files."""
     cuesheet = ""
     for t in merged_file.tracks:
         track_fn = track_filename(basename, t.num, len(merged_file.tracks))
@@ -287,6 +285,7 @@ def gen_split_cuesheet(basename, merged_file):
 
 
 def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=False):
+    """Merges multiple BIN track files into a single binary output file."""
     merged_path = Path(merged_filename)
     if merged_path.exists() and not force:
         e(f"Target merged bin path already exists: {merged_path}")
@@ -304,7 +303,6 @@ def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=F
                     in_fd = infile.fileno()
                     remaining = f.size
 
-                    # Fast-path attempt using kernel sendfile zero-copy
                     use_sendfile = hasattr(os, 'sendfile')
                     if use_sendfile:
                         offset = 0
@@ -322,7 +320,6 @@ def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=F
                                 use_sendfile = False
                                 break
 
-                    # Standard buffered fallback loop
                     if not use_sendfile:
                         while True:
                             chunk = infile.read(buffer_size)
@@ -339,9 +336,9 @@ def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=F
 
 
 def split_files(new_basename, merged_file, outdir, global_blocksize, buffer_size=DEFAULT_BUFFER_SIZE, force=False):
+    """Splits a single merged BIN file back into separate track BIN files."""
     outdir_path = Path(outdir)
 
-    # Check target files first to prevent accidental clobbering
     if not force:
         for t in merged_file.tracks:
             out_basename = track_filename(new_basename, t.num, len(merged_file.tracks))
@@ -380,6 +377,7 @@ def split_files(new_basename, merged_file, outdir, global_blocksize, buffer_size
 
 
 def process_single_cue(cuefile, basename, outdir, is_split, force, buffer_size=DEFAULT_BUFFER_SIZE):
+    """Handles parsing and processing (merging or splitting) for a single CUE file."""
     cuefile_path = Path(cuefile).resolve()
 
     if not cuefile_path.is_file():
@@ -439,7 +437,31 @@ def process_single_cue(cuefile, basename, outdir, is_split, force, buffer_size=D
     return True
 
 
+def auto_select_cue():
+    """Finds CUE files in current working directory and prompts user if multiple exist."""
+    cues = sorted(list(Path('.').glob("*.cue")))
+    if not cues:
+        e("No .cue file found in the current directory.")
+        sys.exit(1)
+    if len(cues) == 1:
+        p(f"Auto-detected CUE file: {cues[0].name}")
+        return cues[0]
+
+    p("Multiple .cue files found:")
+    for idx, c in enumerate(cues, 1):
+        print(f"  [{idx}] {c.name}")
+    try:
+        choice = int(input("Select CUE file number: ")) - 1
+        if 0 <= choice < len(cues):
+            return cues[choice]
+    except (ValueError, KeyboardInterrupt):
+        pass
+    e("Invalid selection.")
+    sys.exit(1)
+
+
 def main():
+    """Parses CLI arguments, handles auto-detection, and executes processing."""
     parser = argparse.ArgumentParser(
         description="Merges or splits BIN/CUE files with optimized I/O operations."
     )
@@ -468,7 +490,6 @@ def main():
 
     buffer_bytes = max(1, args.buffer_mb) * 1024 * 1024
 
-    # Batch processing execution path
     if args.batch:
         batch_dir = Path(args.batch).resolve()
         if not batch_dir.is_dir():
@@ -494,13 +515,21 @@ def main():
             )
         return True
 
-    # Single-file processing execution path
-    if not args.cuefile or not args.basename:
-        parser.error("cuefile and basename are required unless using --batch.")
+    # Auto-detection if positional arguments are missing
+    cuefile = args.cuefile
+    basename = args.basename
+
+    if not cuefile:
+        selected_cue = auto_select_cue()
+        cuefile = str(selected_cue)
+        if not basename:
+            basename = selected_cue.stem + "_merged"
+    elif not basename:
+        basename = Path(cuefile).stem + "_merged"
 
     return process_single_cue(
-        args.cuefile,
-        args.basename,
+        cuefile,
+        basename,
         args.outdir,
         args.split,
         args.force,
