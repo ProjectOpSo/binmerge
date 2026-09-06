@@ -25,6 +25,7 @@
 #
 
 import argparse
+import errno
 import os
 import re
 import sys
@@ -34,14 +35,25 @@ import traceback
 from pathlib import Path
 
 VERBOSE = False
-VERSION_STRING = "1.1.0"
-DEFAULT_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MiB Buffer
+VERSION_STRING = "1.1.0-opt"
+DEFAULT_BUFFER_SIZE = 4 * 1024 * 1024  # 4 MiB buffer: highly efficient and memory safe for mobile devices
 
 # Pre-compiled regular expressions for cue sheet parsing
 FILE_RE = re.compile(r'FILE\s+"?(.*?)"?\s+BINARY', re.IGNORECASE)
 TRACK_RE = re.compile(r'TRACK\s+(\d+)\s+([^\s]+)', re.IGNORECASE)
 INDEX_RE = re.compile(r'INDEX\s+(\d+)\s+(\d+:\d+:\d+)', re.IGNORECASE)
 STAMP_RE = re.compile(r'(\d+):(\d+):(\d+)')
+
+# Common system error codes representing unsupported kernel or filesystem operations
+UNSUPPORTED_ERRNOS = {
+    errno.ENOSYS,      # Function not implemented
+    errno.EINVAL,      # Invalid argument (e.g. alignment or filesystem unsupported)
+    errno.EXDEV,       # Cross-device link / unsupported cross-fs call
+    errno.EOPNOTSUPP,  # Operation not supported
+    errno.ENOTSUP,     # Operation not supported on socket/fs
+    errno.EPERM,       # Operation not permitted (restricted sandbox or FUSE layer)
+    errno.EACCES,      # Permission denied
+}
 
 
 def print_license():
@@ -87,17 +99,22 @@ def p(s):
 class ProgressBar:
     """Renders a real-time progress bar with transfer speed and ETA calculation."""
 
-    def __init__(self, total_bytes, prefix=""):
+    def __init__(self, total_bytes, prefix="", quiet=False):
         self.total_bytes = max(1, total_bytes)
         self.prefix = prefix
+        self.quiet = quiet
         self.current_bytes = 0
-        self.start_time = time.time()
-        self.last_update = 0
+        self.start_time = time.monotonic()
+        self.last_update = 0.0
 
     def update(self, bytes_added):
-        """Updates byte progress and prints formatted progress bar line."""
+        """Updates byte progress and prints formatted progress bar line at controlled intervals."""
         self.current_bytes += bytes_added
-        now = time.time()
+        if self.quiet:
+            return
+
+        now = time.monotonic()
+        # Rate-limit updates to at most once every 0.1 seconds to minimize stdout bottleneck
         if now - self.last_update < 0.1 and self.current_bytes < self.total_bytes:
             return
         self.last_update = now
@@ -113,9 +130,9 @@ class ProgressBar:
         eta_h, eta_m = divmod(eta_m, 60)
         eta_str = f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}" if eta_h > 0 else f"{eta_m:02d}:{eta_s:02d}"
 
-        curr_mb = self.current_bytes / (1024 * 1024)
-        total_mb = self.total_bytes / (1024 * 1024)
-        speed_mb = speed / (1024 * 1024)
+        curr_mb = self.current_bytes / 1048576
+        total_mb = self.total_bytes / 1048576
+        speed_mb = speed / 1048576
 
         bar_length = 20
         filled_length = int(bar_length * self.current_bytes // self.total_bytes)
@@ -129,6 +146,8 @@ class ProgressBar:
 
     def finish(self):
         """Completes the progress bar display and moves to a new line."""
+        if self.quiet:
+            return
         self.update(0)
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -145,13 +164,13 @@ class Track:
         self.file_offset = None
 
         if disc_blocksize_ref[0] is None:
-            if track_type in ['AUDIO', 'MODE1/2352', 'MODE2/2352', 'CDI/2352']:
+            if track_type in ('AUDIO', 'MODE1/2352', 'MODE2/2352', 'CDI/2352'):
                 disc_blocksize_ref[0] = 2352
             elif track_type == 'CDG':
                 disc_blocksize_ref[0] = 2448
             elif track_type == 'MODE1/2048':
                 disc_blocksize_ref[0] = 2048
-            elif track_type in ['MODE2/2336', 'CDI/2336']:
+            elif track_type in ('MODE2/2336', 'CDI/2336'):
                 disc_blocksize_ref[0] = 2336
             d(f"Locked disc blocksize to {disc_blocksize_ref[0]}")
 
@@ -260,31 +279,153 @@ def track_filename(prefix, track_num, track_count):
 
 def gen_merged_cuesheet(basename, files, global_blocksize):
     """Generates a new CUE sheet string for a single merged BIN file."""
-    cuesheet = f'FILE "{basename}.bin" BINARY\n'
+    cuesheet_lines = [f'FILE "{basename}.bin" BINARY']
     sector_pos = 0
     for f in files:
         for t in f.tracks:
-            cuesheet += f'  TRACK {t.num:02d} {t.track_type}\n'
+            cuesheet_lines.append(f'  TRACK {t.num:02d} {t.track_type}')
             for i in t.indexes:
-                cuesheet += f'    INDEX {i["id"]:02d} {sectors_to_cuestamp(sector_pos + i["file_offset"])}\n'
+                cuesheet_lines.append(
+                    f'    INDEX {i["id"]:02d} {sectors_to_cuestamp(sector_pos + i["file_offset"])}'
+                )
         sector_pos += f.size // global_blocksize
-    return cuesheet
+    return "\n".join(cuesheet_lines) + "\n"
 
 
 def gen_split_cuesheet(basename, merged_file):
     """Generates a CUE sheet string corresponding to multiple split track files."""
-    cuesheet = ""
+    cuesheet_lines = []
     for t in merged_file.tracks:
         track_fn = track_filename(basename, t.num, len(merged_file.tracks))
-        cuesheet += f'FILE "{track_fn}" BINARY\n'
-        cuesheet += f'  TRACK {t.num:02d} {t.track_type}\n'
+        cuesheet_lines.append(f'FILE "{track_fn}" BINARY')
+        cuesheet_lines.append(f'  TRACK {t.num:02d} {t.track_type}')
         for i in t.indexes:
             sector_pos = i['file_offset'] - t.indexes[0]['file_offset']
-            cuesheet += f'    INDEX {i["id"]:02d} {sectors_to_cuestamp(sector_pos)}\n'
-    return cuesheet
+            cuesheet_lines.append(f'    INDEX {i["id"]:02d} {sectors_to_cuestamp(sector_pos)}')
+    return "\n".join(cuesheet_lines) + "\n"
 
 
-def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=False):
+def safe_preallocate(fd, total_bytes):
+    """Attempts disk space pre-allocation using fallocate if supported."""
+    if hasattr(os, 'posix_fallocate'):
+        try:
+            os.posix_fallocate(fd, 0, total_bytes)
+            d(f"Pre-allocated {total_bytes} bytes with posix_fallocate")
+            return
+        except OSError as err:
+            if err.errno in UNSUPPORTED_ERRNOS:
+                d(f"posix_fallocate not supported on this filesystem: {err}")
+            else:
+                d(f"posix_fallocate failed: {err}")
+
+
+def copy_file_range_fallback(in_fd, out_fd, count, progress, buffer_size):
+    """Copies bytes from in_fd to out_fd using os.copy_file_range if supported."""
+    if not hasattr(os, 'copy_file_range'):
+        return False, count
+
+    remaining = count
+    while remaining > 0:
+        chunk = min(remaining, buffer_size)
+        try:
+            copied = os.copy_file_range(in_fd, out_fd, chunk)
+            if copied == 0:
+                break
+            remaining -= copied
+            progress.update(copied)
+        except OSError as err:
+            if err.errno in UNSUPPORTED_ERRNOS:
+                d(f"copy_file_range unsupported on current filesystem: {err}")
+                return False, remaining
+            raise
+
+    return True, remaining
+
+
+def sendfile_fallback(in_fd, out_fd, count, progress, buffer_size):
+    """Copies bytes from in_fd to out_fd using os.sendfile if supported."""
+    if not hasattr(os, 'sendfile'):
+        return False, count
+
+    remaining = count
+    # Acquire current offset from in_fd for sendfile offset
+    try:
+        offset = os.lseek(in_fd, 0, os.SEEK_CUR)
+    except OSError:
+        return False, remaining
+
+    while remaining > 0:
+        chunk = min(remaining, buffer_size)
+        try:
+            sent = os.sendfile(out_fd, in_fd, offset, chunk)
+            if sent == 0:
+                break
+            offset += sent
+            remaining -= sent
+            progress.update(sent)
+        except OSError as err:
+            if err.errno in UNSUPPORTED_ERRNOS:
+                d(f"sendfile unsupported on current filesystem: {err}")
+                # Ensure source stream file position is updated to match offset before fallback
+                try:
+                    os.lseek(in_fd, offset, os.SEEK_SET)
+                except OSError:
+                    pass
+                return False, remaining
+            raise
+
+    # Sync Python file object position with lseek after sendfile completion
+    try:
+        os.lseek(in_fd, offset, os.SEEK_SET)
+    except OSError:
+        pass
+
+    return True, remaining
+
+
+def buffered_fallback(infile, outfile, count, progress, buffer, buffer_size):
+    """Fallback copying using a reusable bytearray buffer."""
+    remaining = count
+    view = memoryview(buffer)
+
+    while remaining > 0:
+        chunk_len = min(remaining, buffer_size)
+        nread = infile.readinto(view[:chunk_len])
+        if not nread:
+            break
+        outfile.write(view[:nread])
+        remaining -= nread
+        progress.update(nread)
+
+    return remaining == 0
+
+
+def transfer_bytes(infile, outfile, count, progress, buffer, buffer_size, copy_state):
+    """Transfers 'count' bytes from infile to outfile, using copy_file_range -> sendfile -> buffered copy."""
+    in_fd = infile.fileno()
+    out_fd = outfile.fileno()
+
+    # Priority 1: copy_file_range
+    if copy_state['use_copy_file_range']:
+        success, remaining = copy_file_range_fallback(in_fd, out_fd, count, progress, buffer_size)
+        if success and remaining == 0:
+            return True
+        copy_state['use_copy_file_range'] = False
+        count = remaining
+
+    # Priority 2: sendfile
+    if copy_state['use_sendfile']:
+        success, remaining = sendfile_fallback(in_fd, out_fd, count, progress, buffer_size)
+        if success and remaining == 0:
+            return True
+        copy_state['use_sendfile'] = False
+        count = remaining
+
+    # Priority 3: Reusable buffered fallback
+    return buffered_fallback(infile, outfile, count, progress, buffer, buffer_size)
+
+
+def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=False, quiet=False):
     """Merges multiple BIN track files into a single binary output file."""
     merged_path = Path(merged_filename)
     if merged_path.exists() and not force:
@@ -292,41 +433,28 @@ def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=F
         return False
 
     total_bytes = sum(f.size for f in files)
-    progress = ProgressBar(total_bytes, prefix="MERGE")
+    progress = ProgressBar(total_bytes, prefix="MERGE", quiet=quiet)
+
+    # State tracking to disable unsupported transfer methods for the entire session
+    copy_state = {
+        'use_copy_file_range': hasattr(os, 'copy_file_range'),
+        'use_sendfile': hasattr(os, 'sendfile'),
+    }
+
+    # Allocate a single reusable byte buffer for fallbacks
+    buffer = bytearray(buffer_size)
 
     try:
         with open(merged_path, 'wb') as outfile:
-            out_fd = outfile.fileno()
+            safe_preallocate(outfile.fileno(), total_bytes)
 
             for f in files:
                 with open(f.filename, 'rb') as infile:
-                    in_fd = infile.fileno()
-                    remaining = f.size
-
-                    use_sendfile = hasattr(os, 'sendfile')
-                    if use_sendfile:
-                        offset = 0
-                        while remaining > 0:
-                            chunk_to_send = min(remaining, buffer_size)
-                            try:
-                                sent = os.sendfile(out_fd, in_fd, offset, chunk_to_send)
-                                if sent == 0:
-                                    break
-                                offset += sent
-                                remaining -= sent
-                                progress.update(sent)
-                            except (OSError, AttributeError) as err:
-                                d(f"sendfile unavailable or failed ({err}), falling back to standard read/write")
-                                use_sendfile = False
-                                break
-
-                    if not use_sendfile:
-                        while True:
-                            chunk = infile.read(buffer_size)
-                            if not chunk:
-                                break
-                            outfile.write(chunk)
-                            progress.update(len(chunk))
+                    if not transfer_bytes(
+                        infile, outfile, f.size, progress, buffer, buffer_size, copy_state
+                    ):
+                        e(f"Failed to copy complete data for file: {f.filename}")
+                        return False
     except Exception as ex:
         e(f"Error during file merge: {ex}")
         return False
@@ -335,7 +463,7 @@ def merge_files(merged_filename, files, buffer_size=DEFAULT_BUFFER_SIZE, force=F
     return True
 
 
-def split_files(new_basename, merged_file, outdir, global_blocksize, buffer_size=DEFAULT_BUFFER_SIZE, force=False):
+def split_files(new_basename, merged_file, outdir, global_blocksize, buffer_size=DEFAULT_BUFFER_SIZE, force=False, quiet=False):
     """Splits a single merged BIN file back into separate track BIN files."""
     outdir_path = Path(outdir)
 
@@ -348,6 +476,12 @@ def split_files(new_basename, merged_file, outdir, global_blocksize, buffer_size
                 return False
 
     total_tracks = len(merged_file.tracks)
+    copy_state = {
+        'use_copy_file_range': hasattr(os, 'copy_file_range'),
+        'use_sendfile': hasattr(os, 'sendfile'),
+    }
+    buffer = bytearray(buffer_size)
+
     with open(merged_file.filename, 'rb') as infile:
         for idx, t in enumerate(merged_file.tracks, 1):
             out_basename = track_filename(new_basename, t.num, total_tracks)
@@ -355,28 +489,22 @@ def split_files(new_basename, merged_file, outdir, global_blocksize, buffer_size
             tracksize = t.sectors * global_blocksize
 
             p(f"Writing track {idx}/{total_tracks}: {out_basename}")
-            progress = ProgressBar(tracksize, prefix=f"SPLIT {idx}/{total_tracks}")
-            written = 0
+            progress = ProgressBar(tracksize, prefix=f"SPLIT {idx}/{total_tracks}", quiet=quiet)
 
             with open(out_path, 'wb') as outfile:
-                while written < tracksize:
-                    to_read = min(buffer_size, tracksize - written)
-                    chunk = infile.read(to_read)
-
-                    if not chunk:
-                        progress.finish()
-                        raise IOError(f"Unexpected end of merged BIN file while processing Track {t.num}")
-
-                    outfile.write(chunk)
-                    chunk_len = len(chunk)
-                    written += chunk_len
-                    progress.update(chunk_len)
+                safe_preallocate(outfile.fileno(), tracksize)
+                if not transfer_bytes(
+                    infile, outfile, tracksize, progress, buffer, buffer_size, copy_state
+                ):
+                    progress.finish()
+                    e(f"Unexpected end or error writing Track {t.num}")
+                    return False
 
             progress.finish()
     return True
 
 
-def process_single_cue(cuefile, basename, outdir, is_split, force, buffer_size=DEFAULT_BUFFER_SIZE):
+def process_single_cue(cuefile, basename, outdir, is_split, force, buffer_size=DEFAULT_BUFFER_SIZE, quiet=False):
     """Handles parsing and processing (merging or splitting) for a single CUE file."""
     cuefile_path = Path(cuefile).resolve()
 
@@ -415,7 +543,7 @@ def process_single_cue(cuefile, basename, outdir, is_split, force, buffer_size=D
     if is_split:
         cuesheet = gen_split_cuesheet(basename, cue_map[0])
         p(f"Splitting {len(cue_map[0].tracks)} tracks...")
-        if split_files(basename, cue_map[0], outdir_path, global_blocksize, buffer_size, force=force):
+        if split_files(basename, cue_map[0], outdir_path, global_blocksize, buffer_size, force, quiet):
             p(f"Wrote {len(cue_map[0].tracks)} bin files")
         else:
             e("Unable to split bin files.")
@@ -424,7 +552,7 @@ def process_single_cue(cuefile, basename, outdir, is_split, force, buffer_size=D
         cuesheet = gen_merged_cuesheet(basename, cue_map, global_blocksize)
         p(f"Merging {len(cue_map)} tracks...")
         out_path = outdir_path / f"{basename}.bin"
-        if merge_files(out_path, cue_map, buffer_size=buffer_size, force=force):
+        if merge_files(out_path, cue_map, buffer_size, force, quiet):
             p(f"Wrote {out_path}")
         else:
             e("Unable to merge bin files.")
@@ -460,6 +588,90 @@ def auto_select_cue():
     sys.exit(1)
 
 
+def run_benchmark(tmp_dir, buffer_bytes):
+    """Runs a quick performance benchmark comparing available I/O backends."""
+    import tempfile
+
+    p("Running storage backend benchmark...")
+    test_size = 64 * 1024 * 1024  # 64 MiB test file
+    dummy_data = os.urandom(1024 * 1024)
+
+    bench_dir = Path(tmp_dir) if tmp_dir else Path(tempfile.gettempdir())
+    src_file = bench_dir / "_binmerge_bench_src.tmp"
+    dst_file = bench_dir / "_binmerge_bench_dst.tmp"
+
+    try:
+        with open(src_file, "wb") as f:
+            for _ in range(64):
+                f.write(dummy_data)
+
+        results = []
+
+        # Test copy_file_range
+        if hasattr(os, 'copy_file_range'):
+            try:
+                t0 = time.monotonic()
+                with open(src_file, 'rb') as inf, open(dst_file, 'wb') as outf:
+                    rem = test_size
+                    while rem > 0:
+                        c = os.copy_file_range(inf.fileno(), outf.fileno(), min(rem, buffer_bytes))
+                        if c == 0:
+                            break
+                        rem -= c
+                t1 = time.monotonic()
+                if rem == 0:
+                    results.append(("copy_file_range", (test_size / (1024 * 1024)) / (t1 - t0)))
+            except Exception as ex:
+                d(f"copy_file_range benchmark skipped: {ex}")
+
+        # Test sendfile
+        if hasattr(os, 'sendfile'):
+            try:
+                t0 = time.monotonic()
+                with open(src_file, 'rb') as inf, open(dst_file, 'wb') as outf:
+                    rem = test_size
+                    off = 0
+                    while rem > 0:
+                        c = os.sendfile(outf.fileno(), inf.fileno(), off, min(rem, buffer_bytes))
+                        if c == 0:
+                            break
+                        off += c
+                        rem -= c
+                t1 = time.monotonic()
+                if rem == 0:
+                    results.append(("sendfile", (test_size / (1024 * 1024)) / (t1 - t0)))
+            except Exception as ex:
+                d(f"sendfile benchmark skipped: {ex}")
+
+        # Test buffered readinto
+        try:
+            buf = bytearray(buffer_bytes)
+            view = memoryview(buf)
+            t0 = time.monotonic()
+            with open(src_file, 'rb') as inf, open(dst_file, 'wb') as outf:
+                while True:
+                    n = inf.readinto(view)
+                    if not n:
+                        break
+                    outf.write(view[:n])
+            t1 = time.monotonic()
+            results.append(("buffered readinto", (test_size / (1024 * 1024)) / (t1 - t0)))
+        except Exception as ex:
+            d(f"buffered readinto benchmark failed: {ex}")
+
+        p("Benchmark Results (64 MB test):")
+        for method, speed in results:
+            print(f"  - {method:20s}: {speed:6.2f} MB/s")
+
+    finally:
+        for pth in (src_file, dst_file):
+            if pth.exists():
+                try:
+                    pth.unlink()
+                except OSError:
+                    pass
+
+
 def main():
     """Parses CLI arguments, handles auto-detection, and executes processing."""
     parser = argparse.ArgumentParser(
@@ -476,11 +688,13 @@ def main():
 
     parser.add_argument('-l', '--license', default=False, help='Prints license info and exits', action=LicenseAction)
     parser.add_argument('-v', '--verbose', action='store_true', help='Print debug messages')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Suppress progress bar updates')
     parser.add_argument('-s', '--split', action='store_true', help='Splits a merged BIN file back into individual tracks')
     parser.add_argument('-o', '--outdir', default=None, help='Output directory (defaults to CUE directory)')
     parser.add_argument('-f', '--force', action='store_true', help='Overwrite existing output files')
     parser.add_argument('--batch', help='Process all .cue files in the specified directory sequentially')
-    parser.add_argument('--buffer-mb', type=int, default=16, help='Set I/O buffer size in MiB (default: 16 MiB)')
+    parser.add_argument('--buffer-mb', type=int, default=4, help='Set I/O buffer size in MiB (default: 4 MiB)')
+    parser.add_argument('--benchmark', action='store_true', help='Run storage I/O backend speed benchmark and exit')
 
     args = parser.parse_args()
 
@@ -489,6 +703,10 @@ def main():
         VERBOSE = True
 
     buffer_bytes = max(1, args.buffer_mb) * 1024 * 1024
+
+    if args.benchmark:
+        run_benchmark(args.outdir, buffer_bytes)
+        return True
 
     if args.batch:
         batch_dir = Path(args.batch).resolve()
@@ -511,7 +729,8 @@ def main():
                 args.outdir,
                 args.split,
                 args.force,
-                buffer_size=buffer_bytes
+                buffer_size=buffer_bytes,
+                quiet=args.quiet
             )
         return True
 
@@ -533,7 +752,8 @@ def main():
         args.outdir,
         args.split,
         args.force,
-        buffer_size=buffer_bytes
+        buffer_size=buffer_bytes,
+        quiet=args.quiet
     )
 
 
